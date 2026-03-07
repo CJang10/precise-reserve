@@ -143,11 +143,13 @@ def _resolve_premiums(
             return {int(k): float(v) for k, v in parsed.items()}
         except (json.JSONDecodeError, ValueError, TypeError) as exc:
             raise HTTPException(
-                status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
-                detail=(
-                    f"Could not parse `premiums` field: {exc}. "
-                    'Expected a JSON object, e.g. {"2018": 13500000, "2019": 14200000}'
-                ),
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail={
+                    "error": "InvalidPremiums",
+                    "message": f"Could not parse the `premiums` field: {exc}",
+                    "hint": 'Provide a JSON object mapping accident year to premium, '
+                            'e.g. {"2018": 13500000, "2019": 14200000}',
+                },
             )
 
     if set(triangle.index.tolist()) == set(_DEFAULT_PREMIUMS):
@@ -245,15 +247,22 @@ async def upload_triangle(
     (credibility blend with a priori expected losses) methods are run.
     Results include per-accident-year IBNR and aggregate totals.
     """
-    # ── Validate content type ────────────────────────────────────────────────
+    # ── Case 1: validate file type ────────────────────────────────────────────
     is_csv_mime = (file.content_type or "").lower() in (
         "text/csv", "application/csv", "text/plain", "application/octet-stream",
     )
     is_csv_name = (file.filename or "").lower().endswith(".csv")
     if not (is_csv_mime or is_csv_name):
         raise HTTPException(
-            status_code=status.HTTP_415_UNSUPPORTED_MEDIA_TYPE,
-            detail=f"Expected a .csv file, received content-type '{file.content_type}'.",
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail={
+                "error": "InvalidFileType",
+                "message": (
+                    f"'{file.filename}' does not appear to be a CSV file "
+                    f"(detected content-type: '{file.content_type}')."
+                ),
+                "hint": "Upload a plain-text CSV file with a .csv extension.",
+            },
         )
 
     # ── Write upload to a temp file, then load via data_loader ───────────────
@@ -265,31 +274,69 @@ async def upload_triangle(
 
         try:
             triangle = load_triangle(tmp_path)
+
+        # Case 5: empty file
         except pd.errors.EmptyDataError:
             raise HTTPException(
                 status_code=status.HTTP_400_BAD_REQUEST,
-                detail="The uploaded file is empty or contains no parseable data.",
+                detail={
+                    "error": "EmptyFile",
+                    "message": f"'{file.filename}' is empty or contains no parseable data.",
+                    "hint": "Ensure the file has a header row and at least 3 rows of data.",
+                },
             )
+
+        # Case 1 (extended): file has .csv extension but is not valid text
         except pd.errors.ParserError as exc:
             raise HTTPException(
                 status_code=status.HTTP_400_BAD_REQUEST,
-                detail=(
-                    f"CSV could not be parsed: {exc}. "
-                    "Ensure the file uses comma separators and has a valid header row."
-                ),
+                detail={
+                    "error": "ParseError",
+                    "message": f"'{file.filename}' could not be parsed as a CSV: {exc}",
+                    "hint": (
+                        "Ensure the file uses comma separators, has a header row, "
+                        "and contains no binary content or unusual encoding."
+                    ),
+                },
             )
+
+        # Case 2: accident_year column missing entirely (pandas KeyError on index_col)
         except KeyError as exc:
             raise HTTPException(
-                status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
-                detail=(
-                    f"Missing required column: {exc}. "
-                    "The CSV must include an 'accident_year' column and dev_12…dev_72."
-                ),
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail={
+                    "error": "MissingIndexColumn",
+                    "message": f"Required column not found: {exc}",
+                    "hint": (
+                        "The CSV must have an 'accident_year' column as its first column, "
+                        "followed by dev_12, dev_24, dev_36, dev_48, dev_60, dev_72."
+                    ),
+                },
             )
+
+        # Cases 2, 3, 4: structural / content validation failures from data_loader
         except ValueError as exc:
+            msg = str(exc)
+            # Classify into one of the known cases for a precise error code
+            if "Non-numeric" in msg:
+                error_code = "NonNumericValues"
+            elif "accident year" in msg.lower() or "fewer" in msg.lower():
+                error_code = "InsufficientData"
+            elif "column" in msg.lower():
+                error_code = "InvalidColumns"
+            else:
+                error_code = "InvalidTriangle"
             raise HTTPException(
-                status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
-                detail=str(exc),
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail={
+                    "error": error_code,
+                    "message": msg,
+                    "hint": (
+                        "Check that the triangle has: the correct columns (dev_12…dev_72), "
+                        "at least 3 accident years, only numeric claim values, "
+                        "and a lower-left NaN pattern."
+                    ),
+                },
             )
     finally:
         if tmp_path and tmp_path.exists():
@@ -301,8 +348,12 @@ async def upload_triangle(
         cl.run()
     except ValueError as exc:
         raise HTTPException(
-            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
-            detail=f"Chain Ladder failed: {exc}",
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail={
+                "error": "ChainLadderError",
+                "message": str(exc),
+                "hint": "Verify that adjacent development columns share at least one overlapping row.",
+            },
         )
 
     # ── Resolve premiums ─────────────────────────────────────────────────────
@@ -314,8 +365,15 @@ async def upload_triangle(
         bf.run()
     except ValueError as exc:
         raise HTTPException(
-            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
-            detail=f"Bornhuetter-Ferguson failed: {exc}",
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail={
+                "error": "BFModelError",
+                "message": str(exc),
+                "hint": (
+                    "Check that premiums are provided for every accident year "
+                    "in the triangle and that the ELR is between 0 and 2."
+                ),
+            },
         )
 
     return _build_response(bf, elr)

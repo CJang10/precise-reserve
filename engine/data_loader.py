@@ -6,7 +6,7 @@ Loads and validates a loss development triangle from a CSV file.
 import pandas as pd
 from pathlib import Path
 
-EXPECTED_ACCIDENT_YEARS = 6
+MIN_ACCIDENT_YEARS = 3
 DEV_COLUMNS = ["dev_12", "dev_24", "dev_36", "dev_48", "dev_60", "dev_72"]
 
 
@@ -51,8 +51,10 @@ def load_triangle(filepath: str | Path) -> pd.DataFrame:
 
 def _validate(df: pd.DataFrame) -> None:
     """Run all structural checks on the triangle."""
-    _check_columns(df)
-    _check_shape(df)
+    _check_columns(df)           # required columns present (before anything else)
+    _check_numeric_values(df)    # no strings/nulls masquerading as data
+    _check_accident_year_count(df)  # at least MIN_ACCIDENT_YEARS rows
+    _check_shape(df)             # correct number of dev-period columns
     _check_triangle_pattern(df)
     _check_non_decreasing(df)
     _check_positive_values(df)
@@ -61,21 +63,57 @@ def _validate(df: pd.DataFrame) -> None:
 def _check_columns(df: pd.DataFrame) -> None:
     missing = [c for c in DEV_COLUMNS if c not in df.columns]
     if missing:
-        raise ValueError(f"Missing expected development columns: {missing}")
+        raise ValueError(
+            f"Missing required development columns: {missing}. "
+            f"The triangle must have all of: {DEV_COLUMNS}"
+        )
     extra = [c for c in df.columns if c not in DEV_COLUMNS]
     if extra:
-        raise ValueError(f"Unexpected columns found: {extra}")
+        raise ValueError(
+            f"Unexpected columns found: {extra}. "
+            f"Only these columns are allowed: {DEV_COLUMNS}"
+        )
+
+
+def _check_numeric_values(df: pd.DataFrame) -> None:
+    """All non-empty cells in development columns must be numeric."""
+    for col in [c for c in DEV_COLUMNS if c in df.columns]:
+        coerced = pd.to_numeric(df[col], errors="coerce")
+        # A cell is non-numeric if it wasn't originally NaN but became NaN after coercion
+        bad_mask = coerced.isna() & df[col].notna()
+        if bad_mask.any():
+            bad = {int(yr): str(df.at[yr, col]) for yr in df.index[bad_mask]}
+            raise ValueError(
+                f"Non-numeric value(s) in column '{col}': {bad}. "
+                "All claim amounts must be numbers — remove commas, currency symbols, "
+                "or placeholder text (e.g. 'N/A', '-') before uploading."
+            )
+
+
+def _check_accident_year_count(df: pd.DataFrame) -> None:
+    """Triangle must have at least MIN_ACCIDENT_YEARS rows for credible LDF calculation."""
+    n = len(df)
+    n_cols = len(DEV_COLUMNS)
+    if n < MIN_ACCIDENT_YEARS:
+        raise ValueError(
+            f"Triangle contains only {n} accident year(s); "
+            f"at least {MIN_ACCIDENT_YEARS} are required to calculate credible "
+            "loss development factors."
+        )
+    if n > n_cols:
+        raise ValueError(
+            f"Triangle has {n} accident years but only {n_cols} development periods. "
+            "The number of accident years cannot exceed the number of development periods "
+            "in a standard lower-left triangle."
+        )
 
 
 def _check_shape(df: pd.DataFrame) -> None:
-    rows, cols = df.shape
-    if rows != EXPECTED_ACCIDENT_YEARS:
-        raise ValueError(
-            f"Expected {EXPECTED_ACCIDENT_YEARS} accident years, got {rows}"
-        )
+    _, cols = df.shape
     if cols != len(DEV_COLUMNS):
         raise ValueError(
-            f"Expected {len(DEV_COLUMNS)} development columns, got {cols}"
+            f"Expected {len(DEV_COLUMNS)} development period columns, got {cols}. "
+            f"Required columns: {DEV_COLUMNS}"
         )
 
 
