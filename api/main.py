@@ -26,6 +26,7 @@ from pathlib import Path
 import pandas as pd
 from fastapi import FastAPI, File, Form, HTTPException, UploadFile, status
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import FileResponse
 from pydantic import BaseModel, field_validator
 
 # ------------------------------------------------------------------
@@ -203,6 +204,24 @@ def _build_response(bf: BornhuetterFerguson, elr: float) -> ReserveResponse:
 # ------------------------------------------------------------------
 # Endpoints
 # ------------------------------------------------------------------
+
+_SAMPLE_CSV = _ROOT / "data" / "claims_triangle.csv"
+
+
+@app.get("/sample", summary="Download sample claims triangle CSV")
+def sample_triangle() -> FileResponse:
+    """Returns the bundled sample claims development triangle as a downloadable CSV."""
+    if not _SAMPLE_CSV.exists():
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail={"error": "FileNotFound", "message": "Sample CSV not found on server."},
+        )
+    return FileResponse(
+        path=str(_SAMPLE_CSV),
+        media_type="text/csv",
+        filename="claims_triangle.csv",
+    )
+
 
 @app.get("/health", summary="Liveness check")
 def health() -> dict:
