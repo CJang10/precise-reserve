@@ -1,7 +1,11 @@
-pandas
-numpy
-matplotlib
-scipy
-fastapi
-uvicorn[standard]
-python-multipart
+# Core data / science
+pandas==3.0.1
+numpy==2.4.2
+matplotlib==3.10.8
+scipy==1.17.1
+
+# API
+fastapi==0.135.1
+uvicorn[standard]==0.41.0
+python-multipart==0.0.22
+pydantic==2.12.5
