@@ -17,6 +17,7 @@ Running
     python api/main.py
 """
 
+import io
 import json
 import shutil
 import sys
@@ -26,19 +27,21 @@ from pathlib import Path
 import pandas as pd
 from fastapi import FastAPI, File, Form, HTTPException, Query, UploadFile, status
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import FileResponse
+from fastapi.responses import FileResponse, StreamingResponse
 from pydantic import BaseModel, field_validator
 
 # ------------------------------------------------------------------
-# Path setup — make /engine importable from /api
+# Path setup — make /engine and /api importable
 # ------------------------------------------------------------------
 _ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(_ROOT / "engine"))
+sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from chain_ladder import ChainLadder                      # noqa: E402
 from bornhuetter_ferguson import BornhuetterFerguson      # noqa: E402
 from cape_cod import CapeCod                              # noqa: E402
 from data_loader import load_triangle                     # noqa: E402
+from excel_export import build_excel                      # noqa: E402
 
 # ------------------------------------------------------------------
 # Default premiums (small personal auto insurer, AY 2018–2023)
@@ -263,6 +266,75 @@ def sample_triangle() -> FileResponse:
         path=str(_SAMPLE_CSV),
         media_type="text/csv",
         filename="claims_triangle.csv",
+    )
+
+
+@app.get("/export", summary="Download sample results as Excel workbook")
+def export_excel(
+    elr: float = Query(
+        default=0.65,
+        description="A priori ELR for the BF method (applied to the sample triangle).",
+    ),
+    tail_factor: float = Query(
+        default=1.0,
+        description="Tail development factor beyond dev_72. Must be >= 1.0.",
+    ),
+) -> StreamingResponse:
+    """
+    Run all three reserving methods against the bundled sample triangle and
+    return a formatted Excel workbook (.xlsx) with two tabs:
+
+    - **Triangle** — original claims development triangle, age-to-age LDF triangle
+      (cells are live Excel formulas referencing the data above), volume-weighted
+      average LDFs, and CDFs to ultimate.
+
+    - **Results** — accident year, premium, CL / BF / Cape Cod ultimates (hardcoded),
+      IBNR columns as Excel formulas (= Ultimate − Paid to Date), loss-ratio columns
+      as Excel formulas (= Ultimate / Premium), totals row, and a model-assumptions
+      section.
+    """
+    if not _SAMPLE_CSV.exists():
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail={"error": "FileNotFound", "message": "Sample CSV not found on server."},
+        )
+
+    triangle = load_triangle(_SAMPLE_CSV)
+
+    # Extract premiums from the sample CSV's premium column (falls back to defaults)
+    try:
+        raw = pd.read_csv(_SAMPLE_CSV, index_col="accident_year")
+        raw.index = raw.index.astype(int)
+        export_premiums = (
+            {int(yr): float(v) for yr, v in raw["premium"].items()}
+            if "premium" in raw.columns
+            else _DEFAULT_PREMIUMS
+        )
+    except Exception:
+        export_premiums = _DEFAULT_PREMIUMS
+
+    try:
+        cl = ChainLadder(triangle, tail_factor=tail_factor)
+        cl.run()
+        fitted_tail = cl.fit_tail()
+
+        bf = BornhuetterFerguson(triangle, export_premiums, elr=elr, tail_factor=tail_factor)
+        bf.run()
+
+        cc = CapeCod(triangle, export_premiums, tail_factor=tail_factor)
+        cc.run()
+    except ValueError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail={"error": "ExportModelError", "message": str(exc)},
+        )
+
+    xlsx_bytes = build_excel(triangle, cl, bf, cc, fitted_tail)
+
+    return StreamingResponse(
+        io.BytesIO(xlsx_bytes),
+        media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        headers={"Content-Disposition": 'attachment; filename="precise_reserve_report.xlsx"'},
     )
 
 
