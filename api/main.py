@@ -37,6 +37,7 @@ sys.path.insert(0, str(_ROOT / "engine"))
 
 from chain_ladder import ChainLadder                      # noqa: E402
 from bornhuetter_ferguson import BornhuetterFerguson      # noqa: E402
+from cape_cod import CapeCod                              # noqa: E402
 from data_loader import load_triangle                     # noqa: E402
 
 # ------------------------------------------------------------------
@@ -85,10 +86,13 @@ class AccidentYearResult(BaseModel):
     cl_ibnr: float
     bf_ultimate: float
     bf_ibnr: float
+    cc_ultimate: float
+    cc_ibnr: float
     diff_ibnr: float
     premium: float | None = None
     cl_loss_ratio: float | None = None
     bf_loss_ratio: float | None = None
+    cc_loss_ratio: float | None = None
 
 
 class Totals(BaseModel):
@@ -98,12 +102,15 @@ class Totals(BaseModel):
     cl_ibnr: float
     bf_ultimate: float
     bf_ibnr: float
+    cc_ultimate: float
+    cc_ibnr: float
     diff_ibnr: float
 
 
 class Assumptions(BaseModel):
     """Model assumptions echoed back in the response."""
     elr: float
+    cc_elr: float
     tail_factor: float
     fitted_tail_factor: float
     premiums: dict[int, float]
@@ -176,18 +183,24 @@ def _resolve_premiums(
 
 def _build_response(
     bf: BornhuetterFerguson,
+    cc: CapeCod,
     elr: float,
     tail_factor: float,
     fitted_tail_factor: float,
 ) -> ReserveResponse:
-    """Serialize the BF comparison DataFrame into a ReserveResponse."""
-    df = bf.comparison
+    """Serialize the BF + CC comparison DataFrames into a three-method ReserveResponse."""
+    bf_df = bf.comparison
+    cc_df = cc.cc_summary[["cc_ultimate", "cc_ibnr"]]
+
+    # Join CC columns onto the BF comparison (both share the same accident_year index)
+    df = bf_df.join(cc_df)
 
     results = []
     for year, row in df.iterrows():
         premium = float(row["premium"]) if pd.notna(row.get("premium")) else None
         cl_loss_ratio = round(float(row["cl_ultimate"]) / premium, 4) if premium else None
         bf_loss_ratio = round(float(row["bf_ultimate"]) / premium, 4) if premium else None
+        cc_loss_ratio = round(float(row["cc_ultimate"]) / premium, 4) if premium else None
         results.append(
             AccidentYearResult(
                 accident_year=int(year),
@@ -197,10 +210,13 @@ def _build_response(
                 cl_ibnr=float(row["cl_ibnr"]),
                 bf_ultimate=float(row["bf_ultimate"]),
                 bf_ibnr=float(row["bf_ibnr"]),
+                cc_ultimate=float(row["cc_ultimate"]),
+                cc_ibnr=float(row["cc_ibnr"]),
                 diff_ibnr=float(row["diff_ibnr"]),
                 premium=premium,
                 cl_loss_ratio=cl_loss_ratio,
                 bf_loss_ratio=bf_loss_ratio,
+                cc_loss_ratio=cc_loss_ratio,
             )
         )
 
@@ -210,6 +226,8 @@ def _build_response(
         cl_ibnr=float(df["cl_ibnr"].sum()),
         bf_ultimate=float(df["bf_ultimate"].sum()),
         bf_ibnr=float(df["bf_ibnr"].sum()),
+        cc_ultimate=float(df["cc_ultimate"].sum()),
+        cc_ibnr=float(df["cc_ibnr"].sum()),
         diff_ibnr=float(df["diff_ibnr"].sum()),
     )
 
@@ -218,6 +236,7 @@ def _build_response(
         totals=totals,
         assumptions=Assumptions(
             elr=elr,
+            cc_elr=round(cc.cc_elr, 6),
             tail_factor=tail_factor,
             fitted_tail_factor=fitted_tail_factor,
             premiums={int(k): float(v) for k, v in bf.premiums.items()},
@@ -447,7 +466,24 @@ async def upload_triangle(
             },
         )
 
-    return _build_response(bf, elr, tail_factor, fitted_tail_factor)
+    # ── Cape Cod ─────────────────────────────────────────────────────────────
+    try:
+        cc = CapeCod(triangle, resolved_premiums, tail_factor=tail_factor)
+        cc.run()
+    except ValueError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail={
+                "error": "CapeCodError",
+                "message": str(exc),
+                "hint": (
+                    "Check that premiums are provided for every accident year "
+                    "and that CDFs are finite."
+                ),
+            },
+        )
+
+    return _build_response(bf, cc, elr, tail_factor, fitted_tail_factor)
 
 
 # ------------------------------------------------------------------
