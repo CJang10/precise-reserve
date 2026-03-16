@@ -104,6 +104,8 @@ class Totals(BaseModel):
 class Assumptions(BaseModel):
     """Model assumptions echoed back in the response."""
     elr: float
+    tail_factor: float
+    fitted_tail_factor: float
     premiums: dict[int, float]
 
     @field_validator("elr")
@@ -172,7 +174,12 @@ def _resolve_premiums(
     }
 
 
-def _build_response(bf: BornhuetterFerguson, elr: float) -> ReserveResponse:
+def _build_response(
+    bf: BornhuetterFerguson,
+    elr: float,
+    tail_factor: float,
+    fitted_tail_factor: float,
+) -> ReserveResponse:
     """Serialize the BF comparison DataFrame into a ReserveResponse."""
     df = bf.comparison
 
@@ -211,6 +218,8 @@ def _build_response(bf: BornhuetterFerguson, elr: float) -> ReserveResponse:
         totals=totals,
         assumptions=Assumptions(
             elr=elr,
+            tail_factor=tail_factor,
+            fitted_tail_factor=fitted_tail_factor,
             premiums={int(k): float(v) for k, v in bf.premiums.items()},
         ),
     )
@@ -263,6 +272,15 @@ async def upload_triangle(
         description=(
             "A priori expected loss ratio for the BF method (applied to all accident years). "
             "Must be between 0 and 2."
+        ),
+    ),
+    tail_factor: float = Query(
+        default=1.0,
+        description=(
+            "Tail development factor applied beyond the last observed period (dev_72). "
+            "Default 1.0 assumes the triangle is fully run-off at 72 months. "
+            "Use the fitted_tail_factor in the response as a data-driven starting point. "
+            "Must be >= 1.0."
         ),
     ),
     premiums: str | None = Form(
@@ -395,7 +413,7 @@ async def upload_triangle(
 
     # ── Chain Ladder ─────────────────────────────────────────────────────────
     try:
-        cl = ChainLadder(triangle)
+        cl = ChainLadder(triangle, tail_factor=tail_factor)
         cl.run()
     except ValueError as exc:
         raise HTTPException(
@@ -407,12 +425,14 @@ async def upload_triangle(
             },
         )
 
+    fitted_tail_factor = cl.fit_tail()
+
     # ── Resolve premiums ─────────────────────────────────────────────────────
     resolved_premiums = _resolve_premiums(triangle, cl, elr, premiums, csv_premiums)
 
     # ── Bornhuetter-Ferguson ─────────────────────────────────────────────────
     try:
-        bf = BornhuetterFerguson(triangle, resolved_premiums, elr=elr)
+        bf = BornhuetterFerguson(triangle, resolved_premiums, elr=elr, tail_factor=tail_factor)
         bf.run()
     except ValueError as exc:
         raise HTTPException(
@@ -427,7 +447,7 @@ async def upload_triangle(
             },
         )
 
-    return _build_response(bf, elr)
+    return _build_response(bf, elr, tail_factor, fitted_tail_factor)
 
 
 # ------------------------------------------------------------------

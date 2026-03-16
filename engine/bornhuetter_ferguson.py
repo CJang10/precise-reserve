@@ -71,9 +71,11 @@ class BornhuetterFerguson:
         triangle: pd.DataFrame,
         premiums: dict | pd.Series,
         elr: float | dict[int, float] = 0.65,
+        tail_factor: float = 1.0,
     ) -> None:
         self.triangle = triangle.copy()
         self.premiums = pd.Series(premiums, name="premium", dtype=float)
+        self.tail_factor = tail_factor
 
         if isinstance(elr, dict):
             missing_elr = [yr for yr in self.triangle.index if yr not in elr]
@@ -134,7 +136,7 @@ class BornhuetterFerguson:
         ChainLadder
             Fitted model with ldfs, cdfs, projected_triangle, and summary populated.
         """
-        self.cl = ChainLadder(self.triangle)
+        self.cl = ChainLadder(self.triangle, tail_factor=self.tail_factor)
         self.cl.run()
         return self.cl
 

@@ -34,6 +34,11 @@ class ChainLadder:
         Loss development triangle produced by data_loader.load_triangle().
         Rows are accident years, columns are dev_12 … dev_72.
         Upper-right cells (future periods) must be NaN.
+    tail_factor : float, optional
+        Multiplier applied beyond the last observed development period (default 1.0,
+        meaning the triangle is assumed fully run-off at 72 months). A value of
+        1.05 implies 5% of ultimate losses are still to emerge after dev_72.
+        Must be >= 1.0. Use fit_tail() to get a data-driven recommendation.
 
     Attributes
     ----------
@@ -45,14 +50,27 @@ class ChainLadder:
         Completed triangle after project_to_ultimate().
     summary : pd.DataFrame or None
         IBNR summary table after calculate_ibnr().
+    fitted_tail_factor : float or None
+        Recommended tail factor from fit_tail(), populated only after that method runs.
     """
 
-    def __init__(self, triangle: pd.DataFrame) -> None:
+    def __init__(self, triangle: pd.DataFrame, tail_factor: float = 1.0) -> None:
+        if tail_factor < 1.0:
+            raise ValueError(
+                f"tail_factor must be >= 1.0 (got {tail_factor}). "
+                "A tail factor below 1.0 would imply negative future development."
+            )
+        if tail_factor > 2.0:
+            raise ValueError(
+                f"tail_factor of {tail_factor} exceeds 2.0 — verify this is intentional."
+            )
         self.triangle = triangle.copy()
+        self.tail_factor = tail_factor
         self.ldfs: pd.Series | None = None
         self.cdfs: pd.Series | None = None
         self.projected_triangle: pd.DataFrame | None = None
         self.summary: pd.DataFrame | None = None
+        self.fitted_tail_factor: float | None = None
 
     # ------------------------------------------------------------------
     # Step 1: Age-to-age development factors
@@ -131,8 +149,8 @@ class ChainLadder:
         ldf_values = self.ldfs.values  # ordered 12→24, 24→36, …, 60→72
         cdfs = {}
 
-        # Rightmost column is assumed fully developed — tail factor = 1.0
-        cdf = 1.0
+        # Rightmost column: start from the tail factor (1.0 means fully run-off at dev_72).
+        cdf = self.tail_factor
         cdfs[DEV_COLUMNS[-1]] = cdf
 
         # Multiply backward through the LDF chain
@@ -229,7 +247,9 @@ class ChainLadder:
             paid = row[last_col]
             period = int(last_col.replace("dev_", ""))
             cdf = self.cdfs[last_col]
-            ultimate = self.projected_triangle.at[year, DEV_COLUMNS[-1]]
+            # Apply tail factor: dev_72 value represents development through 72 months;
+            # multiplying by tail_factor projects to true ultimate beyond the triangle.
+            ultimate = self.projected_triangle.at[year, DEV_COLUMNS[-1]] * self.tail_factor
             ibnr = ultimate - paid
             pct_developed = paid / ultimate if ultimate > 0 else np.nan
 
@@ -247,6 +267,90 @@ class ChainLadder:
 
         self.summary = pd.DataFrame(records).set_index("accident_year")
         return self.summary
+
+    # ------------------------------------------------------------------
+    # Tail factor fitting
+    # ------------------------------------------------------------------
+
+    def fit_tail(self, n_ldfs: int = 3) -> float:
+        """
+        Fit an exponential decay curve to the last ``n_ldfs`` LDFs and extrapolate
+        a recommended tail factor beyond the last development period.
+
+        Method
+        ------
+        The LDF excess above 1.0 — i.e. ``y(t) = LDF(t) - 1.0`` — is modelled as:
+
+            y(t) = a · exp(−b · t)
+
+        Taking logs gives a linear model that is solved with ``numpy.polyfit``:
+
+            log y(t) = log a − b · t
+
+        The fitted curve is then extrapolated by discretely multiplying future-period
+        LDFs (at 12-month increments beyond the last observed period) until the
+        incremental LDF falls below 1.0001, at which point the tail is considered
+        converged.
+
+        Parameters
+        ----------
+        n_ldfs : int
+            Number of trailing LDFs to include in the fit (default 3).
+
+        Returns
+        -------
+        float
+            Recommended tail factor (≥ 1.0). Stored in ``self.fitted_tail_factor``.
+
+        Notes
+        -----
+        Returns 1.0 (no tail) when:
+          - Any of the n_ldfs used for fitting is ≤ 1.0 (flat/declining pattern)
+          - The fitted decay rate b ≤ 0 (LDFs not decreasing)
+          - Fewer than 2 LDFs are available
+        """
+        if self.ldfs is None:
+            self.calculate_ldfs()
+
+        ldf_values = self.ldfs.values  # e.g. [LDF12→24, LDF24→36, ..., LDF60→72]
+        n = min(n_ldfs, len(ldf_values))
+
+        if n < 2:
+            self.fitted_tail_factor = 1.0
+            return 1.0
+
+        # x = "from" period of each selected transition, e.g. [36, 48, 60]
+        x = np.array(DEV_PERIODS[-(n + 1):-1], dtype=float)
+        y = ldf_values[-n:] - 1.0  # excess above 1.0; must be strictly positive to log
+
+        if np.any(y <= 0):
+            # Flat or sub-unity LDFs — no credible tail to fit
+            self.fitted_tail_factor = 1.0
+            return 1.0
+
+        # Log-linear fit: log(y) = log(a) - b*x
+        log_y = np.log(y)
+        slope, intercept = np.polyfit(x, log_y, 1)
+        b = -slope       # decay rate (must be positive for exponential decay)
+        a = np.exp(intercept)
+
+        if b <= 0:
+            # LDFs are not decaying — extrapolation not meaningful
+            self.fitted_tail_factor = 1.0
+            return 1.0
+
+        # Multiply extrapolated LDFs from (last_period + 12) until convergence
+        tail = 1.0
+        t = float(DEV_PERIODS[-1] + 12)
+        for _ in range(200):
+            ldf_t = 1.0 + a * np.exp(-b * t)
+            if ldf_t < 1.0001:
+                break
+            tail *= ldf_t
+            t += 12.0
+
+        self.fitted_tail_factor = round(tail, 4)
+        return self.fitted_tail_factor
 
     # ------------------------------------------------------------------
     # Orchestration
