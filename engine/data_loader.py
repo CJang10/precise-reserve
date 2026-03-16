@@ -8,6 +8,7 @@ from pathlib import Path
 
 MIN_ACCIDENT_YEARS = 3
 DEV_COLUMNS = ["dev_12", "dev_24", "dev_36", "dev_48", "dev_60", "dev_72"]
+OPTIONAL_COLUMNS = ["premium"]
 
 
 def load_triangle(filepath: str | Path) -> pd.DataFrame:
@@ -46,7 +47,8 @@ def load_triangle(filepath: str | Path) -> pd.DataFrame:
     df.columns = df.columns.str.strip()
 
     _validate(df)
-    return df
+    # Return only the development columns so callers always get a clean triangle.
+    return df[DEV_COLUMNS].copy()
 
 
 def _validate(df: pd.DataFrame) -> None:
@@ -67,11 +69,11 @@ def _check_columns(df: pd.DataFrame) -> None:
             f"Missing required development columns: {missing}. "
             f"The triangle must have all of: {DEV_COLUMNS}"
         )
-    extra = [c for c in df.columns if c not in DEV_COLUMNS]
+    extra = [c for c in df.columns if c not in DEV_COLUMNS and c not in OPTIONAL_COLUMNS]
     if extra:
         raise ValueError(
             f"Unexpected columns found: {extra}. "
-            f"Only these columns are allowed: {DEV_COLUMNS}"
+            f"Only these columns are allowed: {DEV_COLUMNS} (plus optional: {OPTIONAL_COLUMNS})"
         )
 
 
@@ -109,10 +111,10 @@ def _check_accident_year_count(df: pd.DataFrame) -> None:
 
 
 def _check_shape(df: pd.DataFrame) -> None:
-    _, cols = df.shape
-    if cols != len(DEV_COLUMNS):
+    dev_cols_present = [c for c in df.columns if c in DEV_COLUMNS]
+    if len(dev_cols_present) != len(DEV_COLUMNS):
         raise ValueError(
-            f"Expected {len(DEV_COLUMNS)} development period columns, got {cols}. "
+            f"Expected {len(DEV_COLUMNS)} development period columns, got {len(dev_cols_present)}. "
             f"Required columns: {DEV_COLUMNS}"
         )
 
@@ -123,7 +125,8 @@ def _check_triangle_pattern(df: pd.DataFrame) -> None:
     only the first (n_cols - i) values should be present.
     """
     n_cols = len(DEV_COLUMNS)
-    for i, (year, row) in enumerate(df.iterrows()):
+    dev_df = df[[c for c in DEV_COLUMNS if c in df.columns]]
+    for i, (year, row) in enumerate(dev_df.iterrows()):
         expected_filled = n_cols - i
         actual_filled = row.notna().sum()
         if actual_filled != expected_filled:
@@ -135,7 +138,8 @@ def _check_triangle_pattern(df: pd.DataFrame) -> None:
 
 def _check_non_decreasing(df: pd.DataFrame) -> None:
     """Cumulative paid claims must be non-decreasing across development periods."""
-    for year, row in df.iterrows():
+    dev_df = df[[c for c in DEV_COLUMNS if c in df.columns]]
+    for year, row in dev_df.iterrows():
         values = row.dropna().values
         if any(values[i] > values[i + 1] for i in range(len(values) - 1)):
             raise ValueError(
@@ -145,7 +149,8 @@ def _check_non_decreasing(df: pd.DataFrame) -> None:
 
 
 def _check_positive_values(df: pd.DataFrame) -> None:
-    if (df.dropna(how="all") <= 0).any().any():
+    dev_df = df[[c for c in DEV_COLUMNS if c in df.columns]]
+    if (dev_df.dropna(how="all") <= 0).any().any():
         raise ValueError("Triangle contains zero or negative claim values")
 
 

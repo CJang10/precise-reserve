@@ -24,7 +24,7 @@ import tempfile
 from pathlib import Path
 
 import pandas as pd
-from fastapi import FastAPI, File, Form, HTTPException, UploadFile, status
+from fastapi import FastAPI, File, Form, HTTPException, Query, UploadFile, status
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse
 from pydantic import BaseModel, field_validator
@@ -86,6 +86,9 @@ class AccidentYearResult(BaseModel):
     bf_ultimate: float
     bf_ibnr: float
     diff_ibnr: float
+    premium: float | None = None
+    cl_loss_ratio: float | None = None
+    bf_loss_ratio: float | None = None
 
 
 class Totals(BaseModel):
@@ -127,17 +130,22 @@ def _resolve_premiums(
     cl: ChainLadder,
     elr: float,
     premiums_raw: str | None,
+    csv_premiums: dict[int, float] | None,
 ) -> dict[int, float]:
     """
     Determine which premiums to use for the BF model.
 
     Priority
     --------
-    1. Caller-supplied JSON string {"2018": 13500000, ...}
-    2. Built-in defaults when the triangle covers AY 2018–2023 exactly
-    3. Implied premiums derived from CL ultimates — premium[y] = cl_ultimate[y] / ELR
+    1. Premiums extracted from a `premium` column in the uploaded CSV
+    2. Caller-supplied JSON string via the `premiums` form field
+    3. Built-in defaults when the triangle covers AY 2018–2023 exactly
+    4. Implied premiums derived from CL ultimates — premium[y] = cl_ultimate[y] / ELR
        (this makes BF converge toward CL, but keeps the endpoint functional for any triangle)
     """
+    if csv_premiums is not None:
+        return csv_premiums
+
     if premiums_raw is not None:
         try:
             parsed = json.loads(premiums_raw)
@@ -168,19 +176,26 @@ def _build_response(bf: BornhuetterFerguson, elr: float) -> ReserveResponse:
     """Serialize the BF comparison DataFrame into a ReserveResponse."""
     df = bf.comparison
 
-    results = [
-        AccidentYearResult(
-            accident_year=int(year),
-            paid_to_date=float(row["paid_to_date"]),
-            current_period=int(row["current_period"]),
-            cl_ultimate=float(row["cl_ultimate"]),
-            cl_ibnr=float(row["cl_ibnr"]),
-            bf_ultimate=float(row["bf_ultimate"]),
-            bf_ibnr=float(row["bf_ibnr"]),
-            diff_ibnr=float(row["diff_ibnr"]),
+    results = []
+    for year, row in df.iterrows():
+        premium = float(row["premium"]) if pd.notna(row.get("premium")) else None
+        cl_loss_ratio = round(float(row["cl_ultimate"]) / premium, 4) if premium else None
+        bf_loss_ratio = round(float(row["bf_ultimate"]) / premium, 4) if premium else None
+        results.append(
+            AccidentYearResult(
+                accident_year=int(year),
+                paid_to_date=float(row["paid_to_date"]),
+                current_period=int(row["current_period"]),
+                cl_ultimate=float(row["cl_ultimate"]),
+                cl_ibnr=float(row["cl_ibnr"]),
+                bf_ultimate=float(row["bf_ultimate"]),
+                bf_ibnr=float(row["bf_ibnr"]),
+                diff_ibnr=float(row["diff_ibnr"]),
+                premium=premium,
+                cl_loss_ratio=cl_loss_ratio,
+                bf_loss_ratio=bf_loss_ratio,
+            )
         )
-        for year, row in df.iterrows()
-    ]
 
     totals = Totals(
         paid_to_date=float(df["paid_to_date"].sum()),
@@ -238,19 +253,26 @@ def health() -> dict:
 async def upload_triangle(
     file: UploadFile = File(
         ...,
-        description="Claims triangle CSV (accident_year index, dev_12…dev_72 columns).",
+        description=(
+            "Claims triangle CSV (accident_year index, dev_12…dev_72 columns). "
+            "An optional `premium` column may be included to supply earned premiums per accident year."
+        ),
     ),
-    elr: float = Form(
+    elr: float = Query(
         default=0.65,
-        description="A priori expected loss ratio for the BF method.",
+        description=(
+            "A priori expected loss ratio for the BF method (applied to all accident years). "
+            "Must be between 0 and 2."
+        ),
     ),
     premiums: str | None = Form(
         default=None,
         description=(
             "Optional earned premiums as a JSON object keyed by accident year. "
             'Example: {"2018": 13500000, "2019": 14200000}. '
-            "If omitted, defaults are used for AY 2018–2023; otherwise premiums "
-            "are back-calculated from Chain Ladder ultimates."
+            "Ignored when the CSV already contains a `premium` column. "
+            "If omitted and no CSV column is present, defaults are used for AY 2018–2023; "
+            "otherwise premiums are back-calculated from Chain Ladder ultimates."
         ),
     ),
 ) -> ReserveResponse:
@@ -286,10 +308,20 @@ async def upload_triangle(
 
     # ── Write upload to a temp file, then load via data_loader ───────────────
     tmp_path: Path | None = None
+    csv_premiums: dict[int, float] | None = None
     try:
         with tempfile.NamedTemporaryFile(suffix=".csv", delete=False) as tmp:
             shutil.copyfileobj(file.file, tmp)
             tmp_path = Path(tmp.name)
+
+        # Extract premium column from CSV before triangle validation strips it.
+        try:
+            raw_df = pd.read_csv(tmp_path, index_col="accident_year")
+            raw_df.index = raw_df.index.astype(int)
+            if "premium" in raw_df.columns:
+                csv_premiums = {int(yr): float(v) for yr, v in raw_df["premium"].items()}
+        except Exception:
+            pass  # Let load_triangle produce the proper structured error below.
 
         try:
             triangle = load_triangle(tmp_path)
@@ -376,7 +408,7 @@ async def upload_triangle(
         )
 
     # ── Resolve premiums ─────────────────────────────────────────────────────
-    resolved_premiums = _resolve_premiums(triangle, cl, elr, premiums)
+    resolved_premiums = _resolve_premiums(triangle, cl, elr, premiums, csv_premiums)
 
     # ── Bornhuetter-Ferguson ─────────────────────────────────────────────────
     try:

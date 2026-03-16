@@ -70,14 +70,28 @@ class BornhuetterFerguson:
         self,
         triangle: pd.DataFrame,
         premiums: dict | pd.Series,
-        elr: float = 0.65,
+        elr: float | dict[int, float] = 0.65,
     ) -> None:
-        if not (0.0 < elr < 2.0):
-            raise ValueError(f"ELR of {elr:.2f} is outside a plausible range (0, 2).")
-
         self.triangle = triangle.copy()
         self.premiums = pd.Series(premiums, name="premium", dtype=float)
-        self.elr = elr
+
+        if isinstance(elr, dict):
+            missing_elr = [yr for yr in self.triangle.index if yr not in elr]
+            if missing_elr:
+                raise ValueError(
+                    f"ELR missing for accident year(s): {missing_elr}. "
+                    "Provide an ELR entry for every row in the triangle, or pass a single scalar."
+                )
+            for yr, e in elr.items():
+                if not (0.0 < e < 2.0):
+                    raise ValueError(
+                        f"ELR for accident year {yr} ({e:.2f}) is outside a plausible range (0, 2)."
+                    )
+            self.elr: float | dict[int, float] = {int(k): float(v) for k, v in elr.items()}
+        else:
+            if not (0.0 < elr < 2.0):
+                raise ValueError(f"ELR of {elr:.2f} is outside a plausible range (0, 2).")
+            self.elr = float(elr)
 
         self.cl: ChainLadder | None = None
         self.bf_summary: pd.DataFrame | None = None
@@ -95,6 +109,12 @@ class BornhuetterFerguson:
             )
         if (self.premiums <= 0).any():
             raise ValueError("All premium values must be positive.")
+
+    def _elr_for(self, year: int) -> float:
+        """Return the ELR for a given accident year (supports scalar or per-year dict)."""
+        if isinstance(self.elr, dict):
+            return self.elr[year]
+        return self.elr
 
     # ------------------------------------------------------------------
     # Step 1: Derive CDFs from Chain Ladder
@@ -173,7 +193,8 @@ class BornhuetterFerguson:
             cdf = self.cl.cdfs[last_col]
 
             premium = self.premiums[year]
-            expected_ultimate = premium * self.elr
+            year_elr = self._elr_for(year)
+            expected_ultimate = premium * year_elr
 
             # The unreported fraction: complement of the reciprocal of the CDF.
             # 1/CDF is the "percent paid to date" implied by the development pattern.
@@ -186,7 +207,7 @@ class BornhuetterFerguson:
                 {
                     "accident_year": year,
                     "premium": premium,
-                    "elr": self.elr,
+                    "elr": year_elr,
                     "expected_ultimate": round(expected_ultimate),
                     "paid_to_date": paid,
                     "current_period": period,
@@ -290,8 +311,9 @@ def print_results(model: BornhuetterFerguson) -> None:
         "cl_ultimate", "cl_ibnr", "bf_ultimate", "bf_ibnr", "diff_ibnr",
     ]
 
+    elr_display = "per-year" if isinstance(model.elr, dict) else f"{model.elr:.0%}"
     print("=" * 100)
-    print(f"  BORNHUETTER-FERGUSON vs CHAIN LADDER   |   A Priori ELR: {model.elr:.0%}")
+    print(f"  BORNHUETTER-FERGUSON vs CHAIN LADDER   |   A Priori ELR: {elr_display}")
     print("=" * 100)
 
     display = df.copy().astype(object)
