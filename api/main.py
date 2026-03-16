@@ -269,7 +269,7 @@ def sample_triangle() -> FileResponse:
     )
 
 
-@app.get("/export", summary="Download sample results as Excel workbook")
+@app.api_route("/export", methods=["GET", "POST"], summary="Download sample results as Excel workbook")
 def export_excel(
     elr: float = Query(
         default=0.65,
