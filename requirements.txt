@@ -12,3 +12,6 @@ pydantic==2.12.5
 
 # Excel export
 openpyxl==3.1.5
+
+# AI commentary engine
+anthropic>=0.40.0

@@ -379,14 +379,14 @@ class ChainLadder:
 
 
 # ------------------------------------------------------------------
-# Pretty-print helpers
+# Pretty-print helpers (CLI only, excluded from coverage)
 # ------------------------------------------------------------------
 
-def _fmt_currency(series: pd.Series) -> pd.Series:
+def _fmt_currency(series: pd.Series) -> pd.Series:  # pragma: no cover
     return series.map(lambda x: f"${x:>12,.0f}")
 
 
-def print_results(model: ChainLadder) -> None:
+def print_results(model: ChainLadder) -> None:  # pragma: no cover
     """Print LDFs, CDFs, and the IBNR summary table to stdout."""
     pd.set_option("display.float_format", "{:,.0f}".format)
 
@@ -427,7 +427,7 @@ def print_results(model: ChainLadder) -> None:
     print("=" * 60)
 
 
-if __name__ == "__main__":
+if __name__ == "__main__":  # pragma: no cover
     from data_loader import load_triangle
 
     data_path = Path(__file__).parent.parent / "data" / "claims_triangle.csv"

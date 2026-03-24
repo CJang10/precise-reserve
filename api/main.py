@@ -42,6 +42,11 @@ from bornhuetter_ferguson import BornhuetterFerguson      # noqa: E402
 from cape_cod import CapeCod                              # noqa: E402
 from data_loader import load_triangle                     # noqa: E402
 from excel_export import build_excel                      # noqa: E402
+from anomaly_detector import detect_anomalies             # noqa: E402
+from method_selector import recommend_method              # noqa: E402
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from commentary import generate_commentary                # noqa: E402
 
 # ------------------------------------------------------------------
 # Default premiums (small personal auto insurer, AY 2018–2023)
@@ -126,11 +131,24 @@ class Assumptions(BaseModel):
         return v
 
 
+class Warning(BaseModel):
+    """A data-quality or methodological anomaly flagged during analysis."""
+    type: str
+    severity: str  # "warn" | "error"
+    affected_years: list[int]
+    message: str
+
+
 class ReserveResponse(BaseModel):
     """Full IBNR response returned by POST /upload."""
     results: list[AccidentYearResult]
     totals: Totals
     assumptions: Assumptions
+    warnings: list[Warning] = []
+    recommended_method: str | None = None
+    recommendation_rationale: str | None = None
+    commentary: str | None = None
+    key_risk_flag: bool = False
 
 
 # ------------------------------------------------------------------
@@ -190,6 +208,8 @@ def _build_response(
     elr: float,
     tail_factor: float,
     fitted_tail_factor: float,
+    triangle: "pd.DataFrame",
+    has_premiums: bool,
 ) -> ReserveResponse:
     """Serialize the BF + CC comparison DataFrames into a three-method ReserveResponse."""
     bf_df = bf.comparison
@@ -234,16 +254,50 @@ def _build_response(
         diff_ibnr=float(df["diff_ibnr"].sum()),
     )
 
+    assumptions = Assumptions(
+        elr=elr,
+        cc_elr=round(cc.cc_elr, 6),
+        tail_factor=tail_factor,
+        fitted_tail_factor=fitted_tail_factor,
+        premiums={int(k): float(v) for k, v in bf.premiums.items()},
+    )
+
+    results_dicts = [r.model_dump() for r in results]
+
+    # ── Anomaly detection ─────────────────────────────────────────────────────
+    raw_warnings = detect_anomalies(
+        triangle=triangle,
+        ldfs=bf.cl.ldfs,
+        results=results_dicts,
+        tail_factor=tail_factor,
+    )
+    warnings = [Warning(**w) for w in raw_warnings]
+
+    # ── Method recommendation ─────────────────────────────────────────────────
+    recommended_method, recommendation_rationale = recommend_method(
+        cdfs=bf.cl.cdfs,
+        results=results_dicts,
+        has_premiums=has_premiums,
+        elr=elr,
+    )
+
+    # ── AI commentary (graceful fallback if API unavailable) ──────────────────
+    reserve_dict = {
+        "results": results_dicts,
+        "totals": totals.model_dump(),
+        "assumptions": assumptions.model_dump(),
+    }
+    commentary, key_risk_flag = generate_commentary(reserve_dict)
+
     return ReserveResponse(
         results=results,
         totals=totals,
-        assumptions=Assumptions(
-            elr=elr,
-            cc_elr=round(cc.cc_elr, 6),
-            tail_factor=tail_factor,
-            fitted_tail_factor=fitted_tail_factor,
-            premiums={int(k): float(v) for k, v in bf.premiums.items()},
-        ),
+        assumptions=assumptions,
+        warnings=warnings,
+        recommended_method=recommended_method,
+        recommendation_rationale=recommendation_rationale,
+        commentary=commentary,
+        key_risk_flag=key_risk_flag,
     )
 
 
@@ -555,7 +609,11 @@ async def upload_triangle(
             },
         )
 
-    return _build_response(bf, cc, elr, tail_factor, fitted_tail_factor)
+    return _build_response(
+        bf, cc, elr, tail_factor, fitted_tail_factor,
+        triangle=triangle,
+        has_premiums=(csv_premiums is not None or premiums is not None),
+    )
 
 
 # ------------------------------------------------------------------

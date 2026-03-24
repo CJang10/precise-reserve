@@ -331,7 +331,7 @@ class CapeCod:
 # Pretty-print helper
 # ------------------------------------------------------------------
 
-def print_results(model: CapeCod) -> None:
+def print_results(model: CapeCod) -> None:  # pragma: no cover
     """Print the CC vs Chain Ladder comparison table and aggregate totals."""
     df = model.comparison
 
@@ -377,7 +377,7 @@ def print_results(model: CapeCod) -> None:
     print("=" * 50)
 
 
-if __name__ == "__main__":
+if __name__ == "__main__":  # pragma: no cover
     from data_loader import load_triangle
 
     data_path = Path(__file__).parent.parent / "data" / "claims_triangle.csv"
